@@ -1,0 +1,20 @@
+[Unit]
+Description=Codex Telegram Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/codex-telegram
+Environment=PYTHONPATH=/opt/codex-telegram
+EnvironmentFile=-/opt/codex-telegram/.env
+ExecStart=/opt/codex-telegram/venv/bin/python -m app.services.codex_telegram_bridge
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=codex-telegram-bot
+
+[Install]
+WantedBy=multi-user.target

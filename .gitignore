@@ -1,0 +1,5 @@
+.env
+.codex-telegram-bot/
+venv/
+__pycache__/
+*.pyc

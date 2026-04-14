@@ -36,7 +36,7 @@ class CodexTelegramBridgeHelpersTests(unittest.TestCase):
     def setUp(self) -> None:
         self.config = BridgeConfig(
             telegram_bot_token="token",
-            allowed_usernames={"vvo888"},
+            allowed_usernames={"alice"},
             allowed_chat_ids={12345},
             private_only=True,
             poll_timeout_seconds=50,
@@ -57,13 +57,13 @@ class CodexTelegramBridgeHelpersTests(unittest.TestCase):
         )
 
     def test_parse_allowed_usernames_normalizes_and_deduplicates(self) -> None:
-        self.assertEqual(parse_allowed_usernames(" vvo888,@VVO888, other "), {"vvo888", "other"})
+        self.assertEqual(parse_allowed_usernames(" alice,@ALICE, other "), {"alice", "other"})
 
     def test_parse_allowed_chat_ids_skips_empty_chunks(self) -> None:
         self.assertEqual(parse_allowed_chat_ids("123,,456"), {123, 456})
 
     def test_normalize_username_strips_at_prefix(self) -> None:
-        self.assertEqual(normalize_username("@VvO888 "), "vvo888")
+        self.assertEqual(normalize_username("@AlIcE "), "alice")
 
     def test_build_codex_command_for_new_thread(self) -> None:
         command = build_codex_command(self.config, thread_id=None, prompt="hello")

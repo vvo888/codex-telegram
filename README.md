@@ -2,6 +2,18 @@
 
 Standalone Telegram bridge for the local `codex` CLI.
 
+Run Codex from Telegram, keep one persistent Codex session per Telegram chat, send screenshots and files as context, and point the bridge at any project on the server via `CODEX_TELEGRAM_WORKDIR`.
+
+This repository is intentionally standalone: no dependency on `predictive-dialer`, no bundled production secrets, and no requirement to move existing Codex sessions from another host.
+
+## Highlights
+
+- one Telegram chat maps to one persistent Codex session
+- supports text, images, and document attachments
+- queues later messages while Codex is still busy
+- can attach a chat to one of the latest local Codex sessions
+- runs as a simple `systemd` service with a Python virtualenv
+
 ## What It Does
 
 - accepts text messages from Telegram
@@ -28,8 +40,9 @@ Standalone Telegram bridge for the local `codex` CLI.
 - tests: `tests/test_codex_telegram_bridge.py`
 - example env: `.env.example`
 - systemd unit template: `infrastructure/codex-telegram-bot.service`
+- runtime state directory: `.codex-telegram-bot/` after first start
 
-## Deployment
+## Quick Start
 
 Recommended target paths:
 
@@ -82,6 +95,8 @@ systemctl enable --now codex-telegram-bot.service
 journalctl -u codex-telegram-bot.service -f
 ```
 
+7. Open Telegram and send `/start`.
+
 ## Telegram Commands
 
 - `/help` - show help
@@ -91,8 +106,15 @@ journalctl -u codex-telegram-bot.service -f
 - `/cancel` - clear queued requests and staged attachments
 - `/new` - clear queue and start a fresh Codex session with the next user message
 
+## Security
+
+- No real Telegram tokens, API keys, or passwords are committed in this repository.
+- `.env` is ignored by git and must be created locally from `.env.example`.
+- The default setup enables `CODEX_TELEGRAM_DANGEROUS_BYPASS=true`, which gives Codex broad host access. Treat the bot token like privileged access.
+- One bot token should be polled by one running bridge instance at a time.
+
 ## Notes
 
 - If the service restarts while a request is running, that active request is moved back to the front of the queue on startup.
 - `codex` must be installed on the host and available at `CODEX_TELEGRAM_CLI_PATH`.
-- One bot token should be polled by one running bridge instance at a time.
+- The bridge stores staged uploads and queue state under `/opt/codex-telegram/.codex-telegram-bot/` by default.

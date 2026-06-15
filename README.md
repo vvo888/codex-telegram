@@ -22,14 +22,15 @@ This repository is intentionally standalone: no dependency on `predictive-dialer
 - sends new prompts via `codex exec` and continues context via `codex exec resume`
 - relays intermediate Codex chat messages back to Telegram
 - queues later Telegram messages while Codex is busy
-- supports `/new`, `/status`, `/cancel`, `/sessions`, `/history`
+- supports `/new`, `/status`, `/cancel`, `/stop`, `/reset`, `/sessions`, `/history`
+- supports `/repair_bridge` to start a fresh Codex session for bridge repair
 
 ## Important Behavior
 
 - Authorization is restricted by `TELEGRAM_ALLOWED_USERNAMES` and/or `TELEGRAM_ALLOWED_CHAT_IDS`.
 - By default the service only accepts private chats.
 - Queueing is the default behavior.
-- Immediate hard-interrupt of the current Codex turn is intentionally not implemented.
+- `/stop` and `/reset` terminate the active Codex process; queued requests are kept.
 - Attachments without a caption are staged locally and injected into the next text message.
 - Images are passed to Codex via `--image`; non-image documents are saved on disk and referenced by absolute path in the prompt.
 - By default runtime files live under `/opt/codex-telegram/.codex-telegram-bot/`.
@@ -105,6 +106,8 @@ journalctl -u codex-telegram-bot.service -f
 - `/history` - show compact history for the currently attached session
 - `/cancel` - clear queued requests and staged attachments
 - `/new` - clear queue and start a fresh Codex session with the next user message
+- `/stop` or `/reset` - stop the current Codex process without clearing the queue
+- `/repair_bridge` - clear queue and start a fresh Codex session to diagnose and repair this Telegram bridge
 
 ## Security
 

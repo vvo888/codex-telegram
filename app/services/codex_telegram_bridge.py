@@ -6,6 +6,7 @@ import logging
 import mimetypes
 import os
 import re
+import signal
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -23,6 +24,29 @@ STREAM_READ_CHUNK_BYTES = 16 * 1024
 MEDIA_GROUP_FLUSH_SECONDS = 1.0
 BRIDGE_ROOT = Path(__file__).resolve().parents[2]
 BRIDGE_STATE_DIR = BRIDGE_ROOT / ".codex-telegram-bot"
+BRIDGE_REPAIR_THREAD_NAME = "Ремонт Codex Telegram Bridge"
+BRIDGE_REPAIR_COMMANDS = {"/repair_bridge", "/fix_bridge", "/remont_mosta"}
+BRIDGE_REPAIR_PROMPT = "\n".join(
+    [
+        "Ремонт Codex Telegram Bridge.",
+        "",
+        "Нужно диагностировать и починить мост Telegram <-> Codex на этом сервере.",
+        "Основной проект моста: /opt/codex-telegram",
+        "Основной файл: /opt/codex-telegram/app/services/codex_telegram_bridge.py",
+        "Сервис: codex-telegram-bot.service",
+        "Рабочий проект пользователя для обычных задач: /root/backtesting",
+        "",
+        "Что сделать:",
+        "1. Проверить текущее состояние сервиса и свежие логи.",
+        "2. Найти реальную причину проблемы, если мост падает, не отвечает, не запускает Codex или ломает команды.",
+        "3. Внести минимальные правки по причине проблемы, без демо, моков и лишних улучшений.",
+        "4. Проверить код тестами /opt/codex-telegram/venv/bin/python -m unittest discover -s /opt/codex-telegram/tests -q.",
+        "5. Если менялся код сервиса, перезапустить codex-telegram-bot.service и проверить статус.",
+        "",
+        "Важно: не печатай секреты из /opt/codex-telegram/.env. "
+        "Если без решения пользователя есть неоднозначность, задай уточняющий вопрос.",
+    ]
+)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -141,6 +165,7 @@ def shorten_preview(text: str, limit: int = 220) -> str:
 @dataclass(slots=True)
 class BridgeConfig:
     telegram_bot_token: str
+    bot_username: str
     allowed_usernames: set[str]
     allowed_chat_ids: set[int]
     private_only: bool
@@ -173,6 +198,7 @@ class BridgeConfig:
 
         return cls(
             telegram_bot_token=telegram_bot_token,
+            bot_username=normalize_username(os.getenv("TELEGRAM_BOT_USERNAME", "")),
             allowed_usernames=allowed_usernames,
             allowed_chat_ids=allowed_chat_ids,
             private_only=_env_bool("TELEGRAM_PRIVATE_ONLY", True),
@@ -385,6 +411,7 @@ class BufferedMediaGroup:
     attachments: list[StoredAttachment] = field(default_factory=list)
     text: str = ""
     source_message_id: int | None = None
+    require_bot_mention: bool = False
     flush_task: asyncio.Task[None] | None = field(default=None, repr=False, compare=False)
 
 
@@ -614,6 +641,7 @@ class TelegramCodexBridge:
         self.client: httpx.AsyncClient | None = None
         self.logger = logging.getLogger("codex-telegram-bridge")
         self.media_groups: dict[tuple[int, str], BufferedMediaGroup] = {}
+        self.stopped_request_ids: set[str] = set()
 
     async def run(self) -> None:
         timeout = httpx.Timeout(connect=10.0, read=self.config.poll_timeout_seconds + 10.0, write=10.0, pool=10.0)
@@ -663,11 +691,11 @@ class TelegramCodexBridge:
             task.cancel()
         for state in states:
             if state.active_process and state.active_process.returncode is None:
-                state.active_process.terminate()
+                self._signal_codex_process(state.active_process, signal.SIGTERM)
                 try:
                     await asyncio.wait_for(state.active_process.wait(), timeout=5.0)
                 except asyncio.TimeoutError:
-                    state.active_process.kill()
+                    self._signal_codex_process(state.active_process, signal.SIGKILL)
         await asyncio.gather(
             *[state.worker_task for state in states if state.worker_task],
             return_exceptions=True,
@@ -684,15 +712,38 @@ class TelegramCodexBridge:
         await self._handle_message(message)
 
     def _is_authorized(self, chat: dict[str, Any], from_user: dict[str, Any] | None) -> bool:
-        if self.config.private_only and chat.get("type") != "private":
+        chat_type = chat.get("type")
+        if self.config.private_only and chat_type != "private":
             return False
-        chat_id = int(chat["id"])
-        if chat_id in self.config.allowed_chat_ids:
-            return True
+
         if not from_user:
             return False
+
         username = normalize_username(from_user.get("username", ""))
-        return bool(username) and username in self.config.allowed_usernames
+        username_allowed = bool(username) and username in self.config.allowed_usernames
+
+        if chat_type == "private":
+            chat_id = int(chat["id"])
+            return chat_id in self.config.allowed_chat_ids or username_allowed
+
+        chat_id = int(chat["id"])
+        if chat_id not in self.config.allowed_chat_ids:
+            return False
+        if not self.config.allowed_usernames:
+            return True
+        return username_allowed
+
+    def _message_mentions_bot(self, text: str) -> bool:
+        if not self.config.bot_username:
+            return False
+        pattern = rf"@{re.escape(self.config.bot_username)}(?![A-Za-z0-9_])"
+        return re.search(pattern, text, flags=re.IGNORECASE) is not None
+
+    def _strip_bot_mention(self, text: str) -> str:
+        if not self.config.bot_username:
+            return text.strip()
+        pattern = rf"@{re.escape(self.config.bot_username)}(?![A-Za-z0-9_])"
+        return re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
 
     async def _handle_callback_query(self, callback_query: dict[str, Any]) -> None:
         message = callback_query.get("message") or {}
@@ -781,6 +832,7 @@ class TelegramCodexBridge:
             return
         text = (message.get("text") or message.get("caption") or "").strip()
         media_group_id = str(message.get("media_group_id") or "").strip()
+        require_bot_mention = chat.get("type") != "private"
 
         if media_group_id and attachments:
             await self._buffer_media_group_message(
@@ -789,10 +841,15 @@ class TelegramCodexBridge:
                 text=text,
                 attachments=attachments,
                 source_message_id=message.get("message_id"),
+                require_bot_mention=require_bot_mention,
             )
             return
 
         if text.startswith("/") and not attachments:
+            if require_bot_mention:
+                if not self._message_mentions_bot(text):
+                    return
+                text = self._strip_bot_mention(text)
             await self._handle_command(state, text)
             return
 
@@ -802,6 +859,7 @@ class TelegramCodexBridge:
             text=text,
             attachments=attachments,
             source_message_id=message.get("message_id"),
+            require_bot_mention=require_bot_mention,
         )
 
     async def _process_incoming_payload(
@@ -810,9 +868,15 @@ class TelegramCodexBridge:
         text: str,
         attachments: list[StoredAttachment],
         source_message_id: int | None,
+        require_bot_mention: bool = False,
     ) -> None:
         chat_id = state.chat_id
         normalized_text = text.strip()
+
+        if require_bot_mention:
+            if not self._message_mentions_bot(normalized_text):
+                return
+            normalized_text = self._strip_bot_mention(normalized_text)
 
         if not normalized_text and not attachments:
             await self._send_text(chat_id, "Поддерживаются текст, фото и документы.")
@@ -865,6 +929,7 @@ class TelegramCodexBridge:
         text: str,
         attachments: list[StoredAttachment],
         source_message_id: int | None,
+        require_bot_mention: bool = False,
     ) -> None:
         async with self.state_lock:
             key = (state.chat_id, media_group_id)
@@ -872,6 +937,7 @@ class TelegramCodexBridge:
             if buffer is None:
                 buffer = BufferedMediaGroup(chat_id=state.chat_id, media_group_id=media_group_id)
                 self.media_groups[key] = buffer
+            buffer.require_bot_mention = buffer.require_bot_mention or require_bot_mention
             buffer.attachments.extend(attachments)
             if text and not buffer.text:
                 buffer.text = text.strip()
@@ -915,6 +981,7 @@ class TelegramCodexBridge:
             text=buffer.text,
             attachments=buffer.attachments,
             source_message_id=buffer.source_message_id,
+            require_bot_mention=buffer.require_bot_mention,
         )
 
     async def _handle_command(self, state: ChatState, raw_text: str) -> None:
@@ -938,7 +1005,9 @@ class TelegramCodexBridge:
                         "/sessions - показать последние 7 Codex-сессий и подключиться к одной из них",
                         "/history - показать историю текущей привязанной сессии",
                         "/new - очистить очередь и начать новую Codex-сессию со следующего сообщения",
+                        "/repair_bridge - открыть новую Codex-сессию для ремонта Telegram bridge",
                         "/cancel - очистить очередь и отложенные вложения, не трогая текущий запрос",
+                        "/stop или /reset - остановить текущий Codex-процесс, очередь не очищает",
                         "/help - показать эту справку",
                     ]
                 ),
@@ -966,6 +1035,10 @@ class TelegramCodexBridge:
             except Exception as exc:
                 self.logger.exception("Failed to show history for chat_id=%s thread_id=%s", chat_id, state.thread_id)
                 await self._send_text(chat_id, f"Не удалось загрузить историю сессии: {exc}")
+            return
+
+        if command in {"/stop", "/reset"}:
+            await self._send_text(chat_id, await self._stop_active_process(state))
             return
 
         if command == "/cancel":
@@ -1012,7 +1085,95 @@ class TelegramCodexBridge:
             await self._send_text(chat_id, notice)
             return
 
+        if command in BRIDGE_REPAIR_COMMANDS:
+            extra_prompt = parts[1].strip() if len(parts) > 1 else ""
+            await self._start_bridge_repair_session(state, extra_prompt)
+            return
+
         await self._send_text(chat_id, "Неизвестная команда. Используйте /help.")
+
+    async def _start_bridge_repair_session(self, state: ChatState, extra_prompt: str = "") -> None:
+        prompt = BRIDGE_REPAIR_PROMPT
+        if extra_prompt:
+            prompt = f"{prompt}\n\nДополнительное сообщение пользователя:\n{extra_prompt}"
+
+        removed_requests: list[PendingRequest]
+        removed_pending: list[StoredAttachment]
+        async with self.state_lock:
+            removed_requests = list(state.queue)
+            removed_pending = list(state.pending_attachments)
+            dropped = len(removed_requests)
+            pending_count = len(removed_pending)
+
+            state.queue.clear()
+            state.pending_attachments.clear()
+            state.last_error = None
+            state.queue.append(PendingRequest.create(text=prompt))
+
+            if state.active_request is not None:
+                state.reset_session_after_current = True
+                notice = (
+                    "Задача ремонта моста поставлена следующей в новую Codex-сессию. "
+                    "Текущий запрос сначала завершится."
+                )
+            else:
+                state.thread_id = None
+                state.thread_name = BRIDGE_REPAIR_THREAD_NAME
+                state.reset_session_after_current = False
+                notice = "Запускаю новую Codex-сессию для ремонта Telegram bridge."
+
+            self._persist_locked()
+
+        self._delete_request_attachments(removed_requests)
+        self._delete_attachments(removed_pending)
+        if dropped or pending_count:
+            notice = (
+                f"{notice}\nОчистил старую очередь: {dropped} запросов, "
+                f"отложенных вложений: {pending_count}."
+            )
+        await self._send_text(state.chat_id, notice)
+        async with self.state_lock:
+            self._ensure_worker(state)
+
+    async def _stop_active_process(self, state: ChatState) -> str:
+        async with self.state_lock:
+            process = state.active_process
+            active_request = state.active_request
+            if active_request is None or process is None or process.returncode is not None:
+                return "Активного Codex-процесса нет."
+            self.stopped_request_ids.add(active_request.request_id)
+            preview = active_request.text[:160]
+
+        self._signal_codex_process(process, signal.SIGTERM)
+        killed = False
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            killed = True
+            self._signal_codex_process(process, signal.SIGKILL)
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                self.logger.error("Failed to stop Codex process pid=%s", process.pid)
+                return f"Не удалось остановить Codex-процесс pid={process.pid}. Проверьте сервис вручную."
+
+        prefix = "Codex не завершился по TERM, убил процесс." if killed else "Остановил текущий Codex-процесс."
+        return f"{prefix}\nЗапрос: {preview}"
+
+    def _signal_codex_process(self, process: asyncio.subprocess.Process, sig: signal.Signals) -> None:
+        if process.returncode is not None:
+            return
+        try:
+            os.killpg(process.pid, sig)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+        if sig == signal.SIGKILL:
+            process.kill()
+        else:
+            process.terminate()
 
     def _format_status(self, state: ChatState) -> str:
         lines = ["Статус Codex bridge"]
@@ -1299,7 +1460,7 @@ class TelegramCodexBridge:
             async with self.state_lock:
                 state = self.chats[chat_id]
                 if state.active_process and state.active_process.returncode is None:
-                    state.active_process.terminate()
+                    self._signal_codex_process(state.active_process, signal.SIGTERM)
                 if state.active_request is not None:
                     state.queue.insert(0, state.active_request)
                 state.active_request = None
@@ -1332,6 +1493,7 @@ class TelegramCodexBridge:
             cwd=self.config.workdir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
 
         async with self.state_lock:
@@ -1348,6 +1510,11 @@ class TelegramCodexBridge:
         heartbeat_task.cancel()
         consumer_results = await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
         await asyncio.gather(heartbeat_task, return_exceptions=True)
+        stopped_by_user = request.request_id in self.stopped_request_ids
+        self.stopped_request_ids.discard(request.request_id)
+
+        if stopped_by_user:
+            return False, "Codex-запрос остановлен вручную."
 
         consumer_errors = [result for result in consumer_results if isinstance(result, Exception)]
         if consumer_errors:

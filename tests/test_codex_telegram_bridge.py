@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.services.codex_telegram_bridge import (
+    BRIDGE_REPAIR_THREAD_NAME,
     BridgeConfig,
     BridgeStateStore,
     ChatState,
@@ -36,6 +39,7 @@ class CodexTelegramBridgeHelpersTests(unittest.TestCase):
     def setUp(self) -> None:
         self.config = BridgeConfig(
             telegram_bot_token="token",
+            bot_username="scalp_scaner_bot",
             allowed_usernames={"alice"},
             allowed_chat_ids={12345},
             private_only=True,
@@ -64,6 +68,50 @@ class CodexTelegramBridgeHelpersTests(unittest.TestCase):
 
     def test_normalize_username_strips_at_prefix(self) -> None:
         self.assertEqual(normalize_username("@AlIcE "), "alice")
+
+    def test_authorization_allows_private_chat_by_username(self) -> None:
+        bridge = TelegramCodexBridge(self.config)
+        self.assertTrue(
+            bridge._is_authorized(
+                {"id": 999, "type": "private"},
+                {"username": "Alice"},
+            )
+        )
+
+    def test_authorization_allows_group_chat_only_for_allowed_username(self) -> None:
+        config = self.config
+        config.private_only = False
+        bridge = TelegramCodexBridge(config)
+        self.assertTrue(
+            bridge._is_authorized(
+                {"id": 12345, "type": "group"},
+                {"username": "Alice"},
+            )
+        )
+        self.assertFalse(
+            bridge._is_authorized(
+                {"id": 12345, "type": "group"},
+                {"username": "Bob"},
+            )
+        )
+
+    def test_authorization_rejects_non_allowed_group_chat(self) -> None:
+        config = self.config
+        config.private_only = False
+        bridge = TelegramCodexBridge(config)
+        self.assertFalse(
+            bridge._is_authorized(
+                {"id": 54321, "type": "group"},
+                {"username": "Alice"},
+            )
+        )
+
+    def test_group_mention_helpers_detect_and_strip_bot_username(self) -> None:
+        bridge = TelegramCodexBridge(self.config)
+        self.assertTrue(bridge._message_mentions_bot("проверь @scalp_scaner_bot"))
+        self.assertTrue(bridge._message_mentions_bot("/status@scalp_scaner_bot"))
+        self.assertFalse(bridge._message_mentions_bot("проверь просто текст"))
+        self.assertEqual(bridge._strip_bot_mention("/status@scalp_scaner_bot"), "/status")
 
     def test_build_codex_command_for_new_thread(self) -> None:
         command = build_codex_command(self.config, thread_id=None, prompt="hello")
@@ -302,6 +350,85 @@ class CodexTelegramBridgeHelpersTests(unittest.TestCase):
         self.assertEqual(state.queue[0].text, "caption text")
         self.assertEqual(len(state.queue[0].attachments), 3)
         self.assertTrue(any("Вложений в запросе: 3." in message for message in sent_messages))
+
+    def test_stop_command_terminates_active_process(self) -> None:
+        bridge = TelegramCodexBridge(self.config)
+        state = ChatState(chat_id=12345)
+        state.active_request = PendingRequest(request_id="active", text="long running", created_at=1.0)
+        bridge.chats[state.chat_id] = state
+        sent_messages: list[str] = []
+
+        async def _send_text(chat_id: int, text: str, reply_markup=None) -> None:
+            sent_messages.append(text)
+
+        bridge._send_text = _send_text  # type: ignore[method-assign]
+
+        async def _run() -> None:
+            process = await asyncio.create_subprocess_exec("sleep", "30", start_new_session=True)
+            state.active_process = process
+            try:
+                await bridge._handle_command(state, "/stop")
+                self.assertIsNotNone(process.returncode)
+            finally:
+                if process.returncode is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    await process.wait()
+
+        asyncio.run(_run())
+        self.assertTrue(any("Codex-процесс" in message for message in sent_messages))
+
+    def test_repair_bridge_command_starts_new_repair_session(self) -> None:
+        bridge = TelegramCodexBridge(self.config)
+        state = ChatState(chat_id=12345, thread_id="old-thread", thread_name="Old thread")
+        bridge.chats[state.chat_id] = state
+        sent_messages: list[str] = []
+
+        async def _send_text(chat_id: int, text: str, reply_markup=None) -> None:
+            sent_messages.append(text)
+
+        bridge._send_text = _send_text  # type: ignore[method-assign]
+        bridge._ensure_worker = lambda current_state: None  # type: ignore[method-assign]
+
+        async def _run() -> None:
+            await bridge._handle_command(state, "/repair_bridge проверь ошибку service_tier")
+
+        asyncio.run(_run())
+        self.assertIsNone(state.thread_id)
+        self.assertEqual(state.thread_name, BRIDGE_REPAIR_THREAD_NAME)
+        self.assertEqual(len(state.queue), 1)
+        self.assertIn("/opt/codex-telegram", state.queue[0].text)
+        self.assertIn("service_tier", state.queue[0].text)
+        self.assertTrue(any("ремонта Telegram bridge" in message for message in sent_messages))
+
+    def test_repair_bridge_command_clears_queue_and_waits_for_active_request(self) -> None:
+        bridge = TelegramCodexBridge(self.config)
+        state = ChatState(
+            chat_id=12345,
+            thread_id="active-thread",
+            thread_name="Active thread",
+            active_request=PendingRequest(request_id="active", text="busy", created_at=1.0),
+            queue=[PendingRequest(request_id="queued", text="old queued", created_at=2.0)],
+        )
+        bridge.chats[state.chat_id] = state
+        sent_messages: list[str] = []
+
+        async def _send_text(chat_id: int, text: str, reply_markup=None) -> None:
+            sent_messages.append(text)
+
+        bridge._send_text = _send_text  # type: ignore[method-assign]
+        bridge._ensure_worker = lambda current_state: None  # type: ignore[method-assign]
+
+        async def _run() -> None:
+            await bridge._handle_command(state, "/remont_mosta")
+
+        asyncio.run(_run())
+        self.assertEqual(state.thread_id, "active-thread")
+        self.assertEqual(state.thread_name, "Active thread")
+        self.assertTrue(state.reset_session_after_current)
+        self.assertEqual(len(state.queue), 1)
+        self.assertIn("Ремонт Codex Telegram Bridge", state.queue[0].text)
+        self.assertNotIn("old queued", state.queue[0].text)
+        self.assertTrue(any("Текущий запрос сначала завершится" in message for message in sent_messages))
 
     def test_summarize_codex_error_maps_cloudflare_403_to_short_message(self) -> None:
         message = summarize_codex_error(
